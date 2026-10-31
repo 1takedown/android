@@ -18,10 +18,12 @@ import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import java.time.Clock
+import java.time.Instant
 import javax.inject.Inject
 import kotlin.time.Duration.Companion.milliseconds
 
 private const val ONE_SECOND_MILLISECOND = 1000L
+private const val STOP_TIMEOUT_DELAY_MS = 5000L
 
 /**
  * Primary implementation of [TotpCodeManager].
@@ -83,7 +85,9 @@ class TotpCodeManagerImpl @Inject constructor(
                 }
                 .stateIn(
                     scope = itemScope,
-                    started = SharingStarted.WhileSubscribed(),
+                    started = SharingStarted.WhileSubscribed(
+                        stopTimeoutMillis = STOP_TIMEOUT_DELAY_MS,
+                    ),
                     initialValue = null,
                 )
         }
@@ -101,7 +105,7 @@ class TotpCodeManagerImpl @Inject constructor(
             val dateTime = clock.instant()
             val time = dateTime.epochSecond.toInt()
 
-            if (verificationCodeItem == null || verificationCodeItem.isExpired(clock)) {
+            if (verificationCodeItem == null || verificationCodeItem.isExpired(dateTime)) {
                 // If the item is expired, or we haven't generated our first item,
                 // generate a new code using the SDK:
                 authenticatorSdkSource
@@ -120,7 +124,7 @@ class TotpCodeManagerImpl @Inject constructor(
                             periodSeconds = response.period.toInt(),
                             timeLeftSeconds = response.period.toInt() -
                                 (time % response.period.toInt()),
-                            issueTime = clock.millis(),
+                            issueTime = dateTime.toEpochMilli(),
                             id = item.cipherId,
                             issuer = item.issuer,
                             label = item.label,
@@ -133,21 +137,24 @@ class TotpCodeManagerImpl @Inject constructor(
                         emit(null)
                         return@flow
                     }
-            } else {
-                // Item is not expired, just update time left:
-                verificationCodeItem = verificationCodeItem.copy(
-                    timeLeftSeconds = verificationCodeItem.periodSeconds -
-                        (time % verificationCodeItem.periodSeconds),
-                )
             }
 
+            val currentItem = verificationCodeItem
+            val emissionTime = clock.instant()
+            if (currentItem == null || currentItem.isExpired(emissionTime)) {
+                continue
+            }
+            verificationCodeItem = currentItem.copy(
+                timeLeftSeconds = currentItem.periodSeconds -
+                    (emissionTime.epochSecond % currentItem.periodSeconds).toInt(),
+            )
             emit(verificationCodeItem)
-            delay(ONE_SECOND_MILLISECOND.milliseconds)
+            // Wait until the start of the next second
+            delay((ONE_SECOND_MILLISECOND - clock.millis() % ONE_SECOND_MILLISECOND).milliseconds)
         }
     }
 }
 
-private fun VerificationCodeItem.isExpired(clock: Clock): Boolean {
-    val timeExpired = issueTime + (timeLeftSeconds * ONE_SECOND_MILLISECOND)
-    return timeExpired < clock.millis()
-}
+private fun VerificationCodeItem.isExpired(dateTime: Instant): Boolean =
+    Instant.ofEpochMilli(issueTime).epochSecond / periodSeconds !=
+        dateTime.epochSecond / periodSeconds
